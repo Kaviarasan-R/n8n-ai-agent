@@ -1,0 +1,2341 @@
+{
+  "name": "Build Your First AI Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 1. Database setup\n### Run this ONCE, manually, before anything else.\n\nCreates four tables and the `match_documents` function that the\nSupabase vector node calls over RPC.\n\n**documents** - text chunks + embeddings. Text files only.\n**document_metadata** - one row per file. The card catalog the agent reads.\n**document_rows** - spreadsheet rows as jsonb. Never embedded.\n**question_log** - every question, for /gaps and the Sunday digest.\n\n⚠️ **Embedding dimension is 3072.** Both Gemini embedding nodes must be\nset to `outputDimensionality: 3072` or every insert will fail. \n",
+        "height": 344,
+        "width": 720,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3008,
+        -4688
+      ],
+      "id": "84102b82-7114-4d12-bbfd-b44ae36dd3b3",
+      "name": "note_1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "create extension if not exists vector;\n\ncreate table if not exists documents (\n  id        bigserial primary key,\n  content   text,\n  metadata  jsonb,\n  embedding vector(3072)\n);\n\ncreate or replace function match_documents (\n  query_embedding vector(3072),\n  match_count int default 5,\n  filter jsonb default '{}'\n) returns table (id bigint, content text, metadata jsonb, similarity float)\nlanguage plpgsql as $$\nbegin\n  return query\n  select d.id, d.content, d.metadata,\n         1 - (d.embedding <=> query_embedding) as similarity\n  from documents d\n  where d.metadata @> filter\n  order by d.embedding <=> query_embedding\n  limit match_count;\nend;\n$$;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -2032,
+        -4576
+      ],
+      "id": "95c61bc2-2227-477e-8609-b360c72f968b",
+      "name": "documents + match_documents()",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "create table if not exists document_metadata (\n  id          text primary key,\n  title       text,\n  file_type   text,\n  shape       text,\n  subject     text,\n  columns     text,\n  row_count   int,\n  uploaded_by bigint,\n  uploader    text,\n  created_at  timestamptz default now()\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1808,
+        -4576
+      ],
+      "id": "73bf8b0e-4547-4049-b01a-7a8a1531f3e4",
+      "name": "document_metadata",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "create table if not exists document_rows (\n  id         bigserial primary key,\n  dataset_id text references document_metadata(id) on delete cascade,\n  row_data   jsonb\n);\ncreate index if not exists idx_rows_dataset on document_rows (dataset_id);\ncreate index if not exists idx_rows_data on document_rows using gin (row_data);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1600,
+        -4576
+      ],
+      "id": "5282c59c-a75c-4b4a-aba8-3e28068ba301",
+      "name": "document_rows",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "create table if not exists question_log (\n  id         bigserial primary key,\n  user_id    bigint,\n  username   text,\n  question   text,\n  answered   boolean default true,\n  tool_used  text,\n  created_at timestamptz default now()\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1376,
+        -4576
+      ],
+      "id": "5acb2e61-8d1e-49ff-988a-729d9221ee21",
+      "name": "question_log",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 2. File ingestion\n### Two doors in - web form, or a file dropped in Telegram.\n\nAccepted: `.pdf .csv .xlsx` - max 20 MB\n(Telegram's `getFile` hard limit).\n\n**Three pipelines, decided by MIME type:**\n\n**A. pdf** -> extract text natively\n**B. csv / xlsx** → rows straight into `document_rows`\n\nA and B converge: chunk → embed → `documents`.\n\nEvery file, whatever its shape, gets exactly **one** row in\n`document_metadata`. That row is what lets the agent decide later\nwhether to search or to query.",
+        "height": 460,
+        "width": 720,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3008,
+        -4096
+      ],
+      "id": "068950a2-ce26-464f-bf4d-afbd840c7674",
+      "name": "note_2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "40cd64c3-517f-43b6-af04-984100d6290f",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.message.document }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2560,
+        -3392
+      ],
+      "id": "ea9894a3-4b0f-4dda-bb28-234752f17517",
+      "name": "Is it a file?"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{ $json.message.document.file_id }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1808,
+        -3808
+      ],
+      "id": "b3c5a89b-4ea1-4b91-8f7a-ff02f95f6228",
+      "name": "Download from Telegram",
+      "webhookId": "4d2707c6-7b6d-47e3-b9f6-e33c90016ddb",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Guards\nThree checks before anything is written:\nsize ≤ 20 MB. MIME allowed readable slug id.\n\n**Why a slug, not a UUID?** The model has to copy this id into its\nSQL. LLMs fumble long random strings, and a wrong id returns zero\nrows with no error - silently wrong.",
+        "height": 316,
+        "width": 340
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1392,
+        -4272
+      ],
+      "id": "67f89531-daff-48a2-8b01-1bc0ca077c9f",
+      "name": "note_3"
+    },
+    {
+      "parameters": {
+        "chunkOverlap": 200,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        32,
+        -3808
+      ],
+      "id": "80642ec9-f6ed-4b68-8054-bf61ade6d409",
+      "name": "Recursive splitter 1000/200"
+    },
+    {
+      "parameters": {
+        "jsonMode": "expressionData",
+        "jsonData": "={{ $('Hand off text').item.json.extracted_text }}",
+        "textSplittingMode": "custom",
+        "options": {
+          "metadata": {
+            "metadataValues": [
+              {
+                "name": "file_id",
+                "value": "={{ $('Guards - size, type, id').item.json.file_id }}"
+              },
+              {
+                "name": "title",
+                "value": "={{ $('Guards - size, type, id').item.json.title }}"
+              },
+              {
+                "name": "subject",
+                "value": "={{ $('Guards - size, type, id').item.json.subject }}"
+              }
+            ]
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        32,
+        -3936
+      ],
+      "id": "6bf32919-429a-40a2-99f2-7d7b56a19655",
+      "name": "Data loader",
+      "retryOnFail": false,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "tableName": {
+          "__rl": true,
+          "value": "documents",
+          "mode": "list",
+          "cachedResultName": "documents"
+        },
+        "options": {
+          "queryName": "match_documents"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.1,
+      "position": [
+        -176,
+        -4096
+      ],
+      "id": "e763642e-cf9c-48b2-a8bf-585eb14ba4c6",
+      "name": "Insert into vector store",
+      "credentials": {
+        "supabaseApi": {
+          "id": "1d1K0ncInDlYT0QN",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Spreadsheets\nNo embeddings. Rows land in `document_rows` as jsonb, and one summary\nrow lands in `document_metadata` carrying the column names and row\ncount.\n\nThat metadata row is the whole routing mechanism - it is how the agent\nlater knows this file exists, that it is tabular, what its columns are\ncalled, and which `dataset_id` to filter on.",
+        "height": 352,
+        "width": 340
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1360,
+        -3632
+      ],
+      "id": "417f6bce-dc74-402a-8f1b-d08b0329331e",
+      "name": "note_5"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "with cleanup as (\n  delete from document_rows where dataset_id = $1\n)\ninsert into document_rows (dataset_id, row_data)\nselect $1, value from jsonb_array_elements($2::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [ $('Read schema').item.json.file_id, $('Read schema').item.json.rows_json ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -256,
+        -3600
+      ],
+      "id": "7d7c15ce-9732-479f-9be0-aae972e3602b",
+      "name": "Insert document_rows",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 3 · The agent\n### Two doors in - n8n Chat (build & debug) or Telegram `/ask` (real users).\n\n**Session key = `chat_id + \"-\" + user_id`.**\nIn a group of people that gives every student their own private thread\ninside the shared room. X's follow-up lands in X's context, not\nY's. Every reply also uses `reply_to_message_id` so it threads\nvisually under the right question.\n\n**The file registry is loaded BEFORE the agent** and injected into the\nsystem prompt. The model never spends a tool call discovering what\nexists - it opens every turn already knowing the catalog. That is\ncontext engineering in its plainest form: if the model always needs it,\nput it in context instead of making it fetch it.\n\n**Four tools, and the model chooses:**\n`search_notes` - vector search over text\n`query_table` - writes its own SQL against spreadsheet rows\n`log_question` - records what was asked, for /gaps and the digest\n\nMax iterations is capped at 5.",
+        "height": 528,
+        "width": 720,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2960,
+        -3104
+      ],
+      "id": "9bd42d81-d12e-4ad9-8519-87d91c4c355d",
+      "name": "note_6"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "6c057fa9-7b42-4afd-b4f1-27e38d5edcf6",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.message.from.is_bot }}",
+              "rightValue": ""
+            },
+            {
+              "id": "ac548e37-ced1-4b77-9a5a-edfb84d61e26",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.message.text }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1952,
+        -2848
+      ],
+      "id": "ce897216-15c4-438b-aa62-112b105a1723",
+      "name": "Human, not a bot?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select coalesce(string_agg(\n  '- id: ' || id || ' | ' || coalesce(title,'') ||\n  ' | shape: ' || shape ||\n  case when shape = 'tabular'\n       then ' | columns: ' || coalesce(columns,'') ||\n            ' | rows: ' || coalesce(row_count,0)::text\n       else '' end ||\n  ' | uploaded by ' || coalesce(uploader,'?'),\n  E'\\n' order by created_at desc\n), 'Nothing uploaded yet.') as doc_list\nfrom document_metadata;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1520,
+        -2976
+      ],
+      "id": "fbff2911-2ceb-48a6-ac95-0ef4bef9f6e9",
+      "name": "Load file registry",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f06525b5-a5be-4b52-8b1b-e4fd3c31a487",
+              "name": "chatInput",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').isExecuted ? $('Telegram Trigger').item.json.message.text.replace(/^\\/ask\\s*/i,'') : $('Chat Trigger - build & debug').item.json.chatInput }}"
+            },
+            {
+              "id": "630ac28d-4a76-4708-b655-5e5a1a677082",
+              "name": "sessionId",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').isExecuted ? $('Telegram Trigger').item.json.message.chat.id + '-' + $('Telegram Trigger').item.json.message.from.id : $('Chat Trigger - build & debug').item.json.sessionId }}"
+            },
+            {
+              "id": "1bb15a1b-525d-4f42-9223-89605463a879",
+              "name": "user_id",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').isExecuted ? $('Telegram Trigger').item.json.message.from.id : 0 }}"
+            },
+            {
+              "id": "7ed99758-ebf1-401f-b0c9-8598675f8f5d",
+              "name": "username",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').isExecuted ? $('Telegram Trigger').item.json.message.from.first_name : 'web' }}"
+            },
+            {
+              "id": "bde5aab1-43ea-4a7e-9d26-b9bb5a430c71",
+              "name": "doc_list",
+              "type": "string",
+              "value": "={{ $json.doc_list }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1296,
+        -2976
+      ],
+      "id": "a6557aaa-3269-4123-a4b8-6e747ae98584",
+      "name": "Prepare agent input"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-4-5",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 4.5"
+        },
+        "options": {
+          "maxTokensToSample": 2048,
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        -1216,
+        -2688
+      ],
+      "id": "2ae8cb91-a104-4de3-b842-74486784868f",
+      "name": "Claude Sonnet",
+      "credentials": {
+        "anthropicApi": {
+          "id": "7gz60rIiIbvXUq5i",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.output }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "reply_to_message_id": "={{ $('Telegram Trigger').item.json.message.message_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -608,
+        -2976
+      ],
+      "id": "849f00a1-b023-47f9-9c44-7efd411b5c68",
+      "name": "↩ Reply in thread",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "45a8ff8d-05c3-449a-9903-477c5a9bf02c",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## 4. The other commands\n### `/docs` `/gaps` `/help` - no LLM involved.\n\nThese are deliberately **not** agent calls. They are fixed questions with\nfixed answers, so they are plain SQL. Every one of these you route around\nthe model is a request you do not pay for and a failure mode you do not\nhave.\n\nWorth saying out loud on the day: *if the steps are known in advance,\ndo not use an agent.* Restraint is the engineering judgment.\n\n**/docs** - what is in the knowledge base, and who put it there\n**/gaps** - the top questions nobody could answer this week\n**/help** - the command list",
+        "height": 368,
+        "width": 720,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2960,
+        -2320
+      ],
+      "id": "d3b77bc1-cb21-4776-821e-487cfa76a626",
+      "name": "note_7"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "d2fdbe2e-4c25-4f95-98fd-a5c8f5ab9c63",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.title }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1952,
+        -2400
+      ],
+      "id": "880beda3-bdc5-4a6d-976e-ff176d3085ff",
+      "name": "Anything uploaded?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all().map(i => i.json);\nconst text = rows.map(r =>\n  '• *' + r.title + '*  _(' + r.shape + ')_\\n' +\n  (r.shape === 'tabular'\n     ? '   ' + r.row_count + ' rows - `' + r.columns + '`\\n'\n     : '') +\n  '   added ' + r.added + ' by ' + r.uploader\n).join('\\n');\nreturn [{ json: { reply:\n  '*Knowledge base - ' + rows.length + ' file(s)*\\n\\n' + text +\n  '\\n\\nAsk about any of it with `/ask`' } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1728,
+        -2480
+      ],
+      "id": "2a010f5a-2d41-413e-bc2f-35c7d1be74a7",
+      "name": "Format doc list"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all().map(i => i.json).filter(r => r.question);\nif (!rows.length) {\n  return [{ json: { reply:\n    '*No gaps this week* — everything asked was answerable from the uploaded files. Either the notes are good, or nobody asked anything hard.' } }];\n}\nconst text = rows.map((r, i) =>\n  (i + 1) + '. ' + r.question + (r.asked > 1 ? '  _(asked ' + r.asked + '×)_' : '')\n).join('\\n');\nreturn [{ json: { reply:\n  '*Questions I could not answer this week*\\n\\n' + text +\n  '\\n\\nThese are the gaps in our notes. Upload something that covers them.' } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1952,
+        -2112
+      ],
+      "id": "25bb8969-83e6-40c3-9611-b347c5a974a8",
+      "name": "Format gaps"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "eecee1a7-73b1-4cdb-8348-1c2afe23aebb",
+              "name": "reply",
+              "type": "string",
+              "value": "=*Class doubt desk*\n\n`/ask <question>` - ask anything about our uploaded material\n`/docs` - see what is in the knowledge base\n`/gaps` - questions nobody could answer this week\n`/help` - this message\n\n*To add material*, just send me a file with a caption:\n`SUBJECT | short description`\ne.g. `DBMS | attendance August CSE-B`\n\nI accept pdf, csv and xlsx - up to 20 MB.\nSpreadsheets I query with SQL. Everything else I search by meaning.\nPhotograph the board, or record the lecture - both work."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2176,
+        -1904
+      ],
+      "id": "3fbc6aac-edee-4362-8ff1-2e4f45243c43",
+      "name": "Build help text"
+    },
+    {
+      "parameters": {
+        "content": "## 5. Sunday digest\n### The thing a chat window cannot do.\n\nFires 6pm every Sunday. Nobody starts it. Nobody is watching.\n\nIt reads a week of `question_log`, counts what the class asked, and sends the group a summary of where they collectively struggled.\n\nNote it uses a *chain*, not an agent. ",
+        "height": 256,
+        "width": 720,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2960,
+        -1648
+      ],
+      "id": "a68e965f-f6cd-43d4-b967-c1a8a83d8c73",
+      "name": "note_8"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select\n  count(*)                                          as total,\n  count(*) filter (where answered = false)          as unanswered,\n  count(distinct user_id)                           as people,\n  coalesce(string_agg(question, E'\\n' order by created_at), '') as questions\nfrom question_log\nwhere created_at > now() - interval '7 days';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1984,
+        -1584
+      ],
+      "id": "d47287e5-8af8-4779-af1c-857f8dfcff7d",
+      "name": "Aggregate the week",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "deac47de-85bb-4117-bb02-1595088a39af",
+              "name": "prompt",
+              "type": "string",
+              "value": "=This week the class asked {{ $json.total }} questions. {{ $json.people }} different people asked something. {{ $json.unanswered }} questions could not be answered from the uploaded notes.\n\nHere is every question, one per line:\n{{ $json.questions }}\n\nWrite a short weekly digest for the class group chat. Group the questions into at most 5 themes and name the themes. Say which theme came up most. Then name the single topic the class most needs to revise, and say what material should be uploaded to close the biggest gap.\n\nPlain text, under 900 characters, no preamble, no markdown headings. Write it as if you are a helpful class rep, not a report."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1760,
+        -1584
+      ],
+      "id": "20de741c-87b9-4e36-b22f-6db92fbc7aa4",
+      "name": "Build digest prompt"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        -1552,
+        -1584
+      ],
+      "id": "186f3fd1-1d39-448d-b370-3f7b00b86dff",
+      "name": "Summarise the week"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-4-5",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 4.5"
+        },
+        "options": {
+          "maxTokensToSample": 600,
+          "temperature": 0.4
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        -1552,
+        -1392
+      ],
+      "id": "fd3e784d-d1b5-4fbc-83b0-18b181952b57",
+      "name": "Claude · digest",
+      "credentials": {
+        "anthropicApi": {
+          "id": "7gz60rIiIbvXUq5i",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 6. Error handler\n### Failures should find you, not vanish.\n\nThis workflow as its own error workflow:\n**Workflow settings → Error workflow → this workflow.**\n\nWithout it, a failed execution is a row in a log nobody reads, and the\nfirst it is a student saying \"the bot is broken.\"\n\nReplace the chat id below with Telegram user id - message @userinfobot to get it.",
+        "height": 292,
+        "width": 720,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2960,
+        -1232
+      ],
+      "id": "9829fb3e-d467-49ad-9347-7ca1e0e2da08",
+      "name": "note_9"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst e = $input.first().json;\nconst wf   = e.workflow?.name || 'unknown workflow';\nconst node = e.execution?.lastNodeExecuted || 'unknown node';\nconst msg  = (e.execution?.error?.message || 'no message').slice(0, 500);\nconst url  = e.execution?.url || '';\nreturn [{ json: { reply:\n  '⚠️ *' + wf + '* failed\\n\\n' +\n  'Node: `' + node + '`\\n' +\n  'Error: ' + msg + '\\n\\n' +\n  (url ? url : 'Open n8n to see the execution.') } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1984,
+        -1152
+      ],
+      "id": "3d570e7f-23d3-4410-80b4-009d2f163e8e",
+      "name": "Format the failure"
+    },
+    {
+      "parameters": {
+        "chatId": "8294681908",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1760,
+        -1152
+      ],
+      "id": "0919669f-8165-40c0-a728-8c0e02bfacb2",
+      "name": "DM the admin",
+      "webhookId": "29d0ec2e-4be4-41c9-9497-f672666fad38",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "07d8291d-5372-452a-adf3-6b1a3073e575",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.rejected ? 'rejected' : $json.kind }}",
+                    "rightValue": "pdf"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "b3bf54ff-79eb-4002-adc9-e862b4de84f4",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.rejected ? 'rejected' : $json.kind }}",
+                    "rightValue": "tabular"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -1152,
+        -3920
+      ],
+      "id": "4f97eb85-3f9d-4d2a-ba2b-80cae95dbd32",
+      "name": "Route by file kind"
+    },
+    {
+      "parameters": {
+        "formTitle": "Upload class material",
+        "formDescription": "pdf, csv, xlsx - max 20MB",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "File",
+              "fieldType": "file",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Subject",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Description",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -2256,
+        -4032
+      ],
+      "id": "8525ab80-a7ef-43ab-bfd8-addf601d11c6",
+      "name": "Upload via web form",
+      "webhookId": "aeb5fc60-4f3b-47be-9363-06aaa1d0133c"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2256,
+        -4576
+      ],
+      "id": "bafd9d9a-2bb7-4c15-96c4-7c8cf2eed7eb",
+      "name": "Run migrations once"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Guards - size, type, id').item.json.chat_id }}",
+        "text": "=✅ Indexed *{{ $('Guards - size, type, id').item.json.title }}*\\n\\nIt is searchable now — try `/ask`",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        256,
+        -4096
+      ],
+      "id": "2a5f4524-d57a-4d4d-b6f9-aa56cd069cc5",
+      "name": "Confirm - text indexed",
+      "webhookId": "4411df72-9129-43a0-a4b0-c628b5667a31",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into document_metadata\n  (id, title, file_type, shape, subject, uploaded_by, uploader)\nvalues ($1, $2, $3, 'text', $4, $5, $6)\non conflict (id) do update set title = excluded.title;",
+        "options": {
+          "queryReplacement": "={{ [ $('Guards - size, type, id').item.json.file_id, $('Guards - size, type, id').item.json.title, $('Guards - size, type, id').item.json.kind, $('Guards - size, type, id').item.json.subject, $('Guards - size, type, id').item.json.uploaded_by, $('Guards - size, type, id').item.json.uploader ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -400,
+        -4096
+      ],
+      "id": "ea4ebf5f-0bbe-43f3-87ba-cf4ffb3e1c27",
+      "name": "Insert metadata - text",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into document_metadata\n  (id, title, file_type, shape, subject, columns, row_count, uploaded_by, uploader)\nvalues ($1, $2, 'tabular', 'tabular', $3, $4, $5, $6, $7)\non conflict (id) do update\n  set title = excluded.title,\n      columns = excluded.columns,\n      row_count = excluded.row_count;",
+        "options": {
+          "queryReplacement": "={{ [ $json.file_id, $json.title, $json.subject, $json.columns, $json.row_count, $json.uploaded_by, $json.uploader ] }}",
+          "replaceEmptyStrings": true
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -480,
+        -3600
+      ],
+      "id": "0cedbb11-7cc1-46b6-a90a-9c4f16b18ad5",
+      "name": "Insert metadata - tabular",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Read schema').item.json.chat_id }}",
+        "text": "=✅ Indexed *{{ $('Read schema').item.json.title }}*\\n\\n{{ $('Read schema').item.json.row_count }} rows\\nColumns: `{{ $('Read schema').item.json.columns }}`\\n\\nThis is tabular — I will run SQL on it, not search it.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -32,
+        -3600
+      ],
+      "id": "e133b2b3-4548-49a7-92df-7690760faad8",
+      "name": "Confirm - table indexed",
+      "webhookId": "0d31c835-b28d-40bc-8f0c-aa25be848c57",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reject_reason || 'Sorry, I cannot handle that file type. Send pdf, png, jpg, mp3, wav, csv or xlsx.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -912,
+        -3344
+      ],
+      "id": "c6e90af9-3bb7-4be6-9bdd-1a083322da71",
+      "name": "Reply - rejected",
+      "webhookId": "095c6268-cee0-4b5b-a2dc-05d1340b870f",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5184bc40-bdaa-43bc-a2ab-495f548e93ac",
+              "name": "file_name",
+              "type": "string",
+              "value": "={{ $binary.File.fileName }}"
+            },
+            {
+              "id": "3f944a4f-5f5a-4a9f-86a3-3555ffabad37",
+              "name": "mime_type",
+              "type": "string",
+              "value": "={{ $binary.File.mimeType }}"
+            },
+            {
+              "id": "f1caee77-df87-484f-889e-8fb61d7d9508",
+              "name": "file_size",
+              "type": "number",
+              "value": "={{ $binary.File.fileSize || 0 }}"
+            },
+            {
+              "id": "10eba3e2-ebec-4558-8750-86d67cdeaef8",
+              "name": "caption",
+              "type": "string",
+              "value": "={{ $json.Subject }} | {{ $json.Description }}"
+            },
+            {
+              "id": "49546c36-5f5d-4ed0-bed1-b82f04d2b969",
+              "name": "uploaded_by",
+              "type": "number",
+              "value": 0
+            },
+            {
+              "id": "25e52eab-69df-425c-aabf-ce26d5fb6d73",
+              "name": "uploader",
+              "type": "string",
+              "value": "web form"
+            },
+            {
+              "id": "c9cb5b87-f62b-4cfe-bbc5-7b1b2dcfbae4",
+              "name": "chat_id",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "id": "5ae6322e-b20c-4ade-a844-74c2aece4a2e",
+              "name": "source",
+              "type": "string",
+              "value": "form"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1600,
+        -4032
+      ],
+      "id": "d700df54-f711-404a-a452-a577a45f4627",
+      "name": "Normalise - form"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "352736fb-d563-4db1-a435-bd4067bdf0e9",
+              "name": "file_name",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').item.json.message.document.file_name }}"
+            },
+            {
+              "id": "e81a453d-13cd-4acc-82fa-9ffba42ea9bf",
+              "name": "mime_type",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').item.json.message.document.mime_type }}"
+            },
+            {
+              "id": "066473b7-97f3-4ffa-a610-13533c8694e7",
+              "name": "file_size",
+              "type": "number",
+              "value": "={{ $('Telegram Trigger').item.json.message.document.file_size }}"
+            },
+            {
+              "id": "0bfe17c9-a17f-4992-9429-2bca621be565",
+              "name": "caption",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').item.json.message.caption || '' }}"
+            },
+            {
+              "id": "3a85df93-7b2f-4ba9-9443-a47df330be95",
+              "name": "uploaded_by",
+              "type": "number",
+              "value": "={{ $('Telegram Trigger').item.json.message.from.id }}"
+            },
+            {
+              "id": "479ff381-d009-4eea-afb2-ae1bfad20c68",
+              "name": "uploader",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').item.json.message.from.first_name }}"
+            },
+            {
+              "id": "a1e21850-05cc-45ff-9ead-211977858950",
+              "name": "chat_id",
+              "type": "string",
+              "value": "={{ $('Telegram Trigger').item.json.message.chat.id }}"
+            },
+            {
+              "id": "250b2524-3d77-405e-965c-47d19cfe7d95",
+              "name": "source",
+              "type": "string",
+              "value": "telegram"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1600,
+        -3808
+      ],
+      "id": "55b4af97-13c6-4a0c-8a5b-c5b7feb5905c",
+      "name": "Normalise - telegram"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst ALLOWED = {\n  'application/pdf':'pdf',\n  'text/csv':'tabular',\n  'application/vnd.ms-excel':'tabular',\n  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'tabular'\n};\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const mime = (j.mime_type || '').toLowerCase();\n  const kind = ALLOWED[mime];\n\n  if (!kind) {\n    j.rejected = true;\n    j.reject_reason = 'Unsupported file type: ' + mime +\n      '\\nI accept: pdf, csv, xlsx';\n  } else if ((j.file_size || 0) > 20 * 1024 * 1024) {\n    j.rejected = true;\n    j.reject_reason = 'That file is over 20 MB — Telegram will not let me download it.';\n  } else {\n    j.rejected = false;\n    j.kind = kind;\n    const base = (j.file_name || 'file')\n      .replace(/\\.[^.]+$/, '').toLowerCase()\n      .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);\n    j.file_id = base + '_' + Date.now().toString(36).slice(-4);\n    const p = (j.caption || '').split('|');\n    j.subject     = (p[0] || 'general').trim();\n    j.description = (p[1] || j.file_name || '').trim();\n    j.title       = j.subject + ' — ' + j.description;\n  }\n  out.push({ json: j, binary: item.binary });\n}\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1376,
+        -3920
+      ],
+      "id": "ee4b5609-f915-4aa7-886c-de5161c4f0bb",
+      "name": "Guards - size, type, id"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -2000,
+        -3040
+      ],
+      "id": "808fb258-e22f-4141-a5a8-a7ae329754ae",
+      "name": "Chat Trigger - build & debug",
+      "webhookId": "e717e403-fdfb-4df8-8595-ce244697aa34"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f5f374fa-9ac8-4be2-9102-1c6ea2160cae",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    },
+                    "leftValue": "={{ ($json.message.text || '').trim().toLowerCase() }}",
+                    "rightValue": "/ask"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "dd58a262-b616-45f0-b3fc-bab19946a12d",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    },
+                    "leftValue": "={{ ($json.message.text || '').trim().toLowerCase() }}",
+                    "rightValue": "/docs"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "b4e9a9cc-54bc-4886-99bf-90e67c8d4d82",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    },
+                    "leftValue": "={{ ($json.message.text || '').trim().toLowerCase() }}",
+                    "rightValue": "/gaps"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "5026e97f-7e74-4ac5-b6b4-612a36fd5812",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    },
+                    "leftValue": "={{ ($json.message.text || '').trim().toLowerCase() }}",
+                    "rightValue": "/help"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": 3
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -1728,
+        -2896
+      ],
+      "id": "e3105bcc-6317-4fe3-9298-a54fd685e3bb",
+      "name": "Route command"
+    },
+    {
+      "parameters": {
+        "content": "## Load File Registry Example\n- id: dbms_unit3_k3f9, subject: DBMS - Unit 3 Normalization, shape: text, uploaded by X\n- id: attendance_aug_b2c1, subject: DBMS - Attendance August, shape: tabular, columns: [roll_no, name, date, status], rows: 1240, uploaded by Y",
+        "width": 480
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1712,
+        -3152
+      ],
+      "id": "248e6f33-da45-4e80-9b05-f8adf714636c",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.chatInput }}",
+        "options": {
+          "systemMessage": "=You are the class doubt desk. You answer only from material this class has uploaded.\n\nFILES AVAILABLE TO YOU\n{{ $json.doc_list }}\n\nROUTING — decide this before anything else\nLook at the file list above and find the file the question is about.\n  shape 'text'     -> search_notes   (pdf, txt, audio transcripts, board photos)\n  shape 'tabular'  -> query_table    (csv, xlsx)\n\nAnything involving a count, sum, average, total, maximum, percentage, or\nfiltering of records is tabular. Spreadsheet contents are NOT in the search\nindex, so search_notes will never find them.\n\nAnything asking what something means, how it works, or to explain a concept\nis text. Use search_notes.\n\nIf no file in the list covers the question, say so and stop. Do not guess.\n\nUSING query_table\nCopy the dataset_id character-for-character from the file list. Never compose\none yourself — an invented id returns nothing and looks like a real answer of\nzero. Column names are listed against each tabular file; use them exactly,\nincluding spaces, capitals and brackets.\n\nValues in row_data are text. Cast before arithmetic:\n  (row_data->>'Duration (Hours)')::numeric\n\nIf a query returns zero rows, assume the id or a column name is wrong rather\nthan reporting zero. Run:\n  select id, title, columns from document_metadata where shape = 'tabular';\nthen retry once with the exact values from that result.\n\nWHEN TWO FILES COULD BOTH ANSWER\nDo not pick one. Name the candidates and ask which they mean. Their reply\nstays in this session, so you will still have the context.\n\nANSWERING\nAlways end your turn with a written answer to the user. Never finish on a\ntool call alone.\nNever invent an answer. If it is not in the files, say so plainly.\nAfter you have given the answer, call log_question once.\nKeep replies under 1200 characters.\nYou are in a group chat — answer only the question you were given.\n\nANSWERING\nWork in this order, always:\n1. Use the tools you need to find the answer.\n2. Call log_question to record the question.\n3. THEN write your answer to the user as plain text, with no tool call.\n\nYour final turn must be text only. Never end on a tool call — if you do,\nthe user receives nothing.\nNever invent an answer. If it is not in the files, say so plainly.\nKeep replies under 1200 characters.\nYou are in a group chat — answer only the question you were given.",
+          "maxIterations": 15
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -1040,
+        -2976
+      ],
+      "id": "391cac91-0354-4cbc-ac20-1403bbea8ac5",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolName": "search_notes",
+        "toolDescription": "Semantic search across class notes: PDFs, text files, transcribed lecture audio, and descriptions of photographed boards or diagrams. Use this for conceptual, explanatory or definitional questions. Returns the most relevant passages together with the file they came from. This does NOT contain spreadsheet data — for anything numeric or record-based, use query_table instead.",
+        "tableName": {
+          "__rl": true,
+          "value": "documents",
+          "mode": "list",
+          "cachedResultName": "documents"
+        },
+        "topK": 5,
+        "options": {
+          "queryName": "match_documents"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.1,
+      "position": [
+        -928,
+        -2688
+      ],
+      "id": "79627432-b4df-4e93-a023-2fc08a407d56",
+      "name": "search_notes",
+      "credentials": {
+        "supabaseApi": {
+          "id": "1d1K0ncInDlYT0QN",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Run a READ-ONLY SQL query against uploaded spreadsheet data.\n\nCRITICAL — THE dataset_id MUST BE COPIED, NEVER INVENTED\nEvery id you may use appears in the file list in your system instructions,\nagainst files marked `shape: tabular`. Copy one character-for-character.\nIf you cannot find the file you need in that list, it has not been uploaded —\nsay so instead of guessing an id. An id you compose yourself will silently\nreturn nothing.\n\nTABLE SHAPE\nAll rows from every spreadsheet live in one table, document_rows:\n  dataset_id  text   — which file the row came from\n  row_data    jsonb  — the row itself, keyed by column name\n\nSo every query needs two things: a dataset_id filter, and row_data->>'column'\nto reach a value. Column names are listed against each tabular file in your\ninstructions — use them exactly, including spaces, capitals and brackets.\n\nPATTERN\n  select <aggregate>\n  from document_rows\n  where dataset_id = '<id copied from the file list>'\n    [and row_data->>'<column>' = '<value>'];\n\nValues in row_data are text. Cast before doing arithmetic:\n  (row_data->>'Duration (Hours)')::numeric\n  (row_data->>'Date')::date\n\nIF YOU GET ZERO ROWS\nZero rows almost always means a wrong dataset_id or a misspelt column, not a\ntrue answer of zero. Do NOT report zero. Instead run:\n\n  select id, title, columns from document_metadata where shape = 'tabular';\n\nTake the exact id and column names from that result and retry once. Only if\nthe retry also returns nothing should you tell the user the data is not there.\n\nNEVER write INSERT, UPDATE, DELETE, DROP or ALTER. The connection is\nread-only and they will fail.",
+        "operation": "executeQuery",
+        "query": "={{ $fromAI('sql_query', 'A read-only SELECT statement against document_rows') }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        -640,
+        -2688
+      ],
+      "id": "e28245fb-6121-4c46-93f4-2a7ba04d0872",
+      "name": "query_table",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Record the question being asked. Call this AFTER you have gathered the answer\nfrom other tools but BEFORE you write your final reply to the user.\n\nSet answered to false if you could not find the answer in the uploaded files —\nthose become the class's learning gaps and appear in /gaps and the weekly digest.",
+        "operation": "executeQuery",
+        "query": "insert into question_log (user_id, username, question, answered, tool_used)\nvalues ($1, $2, $3, $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [ $('Prepare agent input').item.json.user_id, $('Prepare agent input').item.json.username, $fromAI('question', 'the exact question the user asked'), $fromAI('answered', 'true if you found the answer in the uploaded files, false if not', 'boolean'), $fromAI('tool_used', 'which tool you used: search_notes, query_table, both, or none') ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        -496,
+        -2688
+      ],
+      "id": "2b136283-3235-4885-afcc-e12a0a3f181c",
+      "name": "log_question",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.sessionId }}",
+        "contextWindowLength": 20
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        -1072,
+        -2688
+      ],
+      "id": "d91917eb-5bc9-4643-99d6-53ebb8c4a603",
+      "name": "Session memory - per user",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1392,
+        -2688
+      ],
+      "id": "0a5a52a8-f264-4b6e-9f08-549527bc389c",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "HsfoblTg9NaKdfWU",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select title, shape, coalesce(columns,'') as columns,\n       coalesce(row_count,0) as row_count,\n       coalesce(uploader,'?') as uploader,\n       to_char(created_at, 'DD Mon') as added\nfrom document_metadata\norder by created_at desc\nlimit 30;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -2176,
+        -2400
+      ],
+      "id": "e716b5ab-075d-4122-a7d6-5c0337ed50ae",
+      "name": "Fetch registry - /docs",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select question, count(*) as asked\nfrom question_log\nwhere answered = false\n  and created_at > now() - interval '7 days'\ngroup by question\norder by asked desc, max(created_at) desc\nlimit 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -2176,
+        -2112
+      ],
+      "id": "adc3aa61-de4b-43b0-a87c-93ce0861d1c2",
+      "name": "Fetch gaps - /gaps",
+      "credentials": {
+        "postgres": {
+          "id": "yGomKuZpEgrxjGKF",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1520,
+        -2480
+      ],
+      "id": "00a6ac53-f745-43fe-9bff-527098be36f9",
+      "name": "Send - /docs",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "aa963325-a60e-4baf-ad0e-cf382e57dcdb",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "The knowledge base is empty. Send me a pdf, txt, image, audio file or spreadsheet with a caption like `DBMS | unit 3 notes` and I will index it.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1728,
+        -2304
+      ],
+      "id": "b4bdc004-a18e-4d77-8452-7df0aeb7b0c8",
+      "name": "Send - nothing yet",
+      "webhookId": "5a7e86d1-7902-4c86-9fbd-f9dfff6e6ec4",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1728,
+        -2112
+      ],
+      "id": "421896d8-0763-4599-8893-56eaada7d58a",
+      "name": "Send - /gaps",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "dd463bd9-9e19-40a6-9863-284090da6eb0",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1952,
+        -1904
+      ],
+      "id": "3b8f9457-3f5a-42b8-a814-7da3cf5bed44",
+      "name": "Send - /help",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "74ce5d78-5d51-45e4-8131-240a7d3b2f8f",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2208,
+        -1584
+      ],
+      "id": "c1caef2f-f254-45a6-b6a2-ab9645ca68e1",
+      "name": "Sunday 6pm"
+    },
+    {
+      "parameters": {
+        "chatId": "-5523625116",
+        "text": "=📊 *This week in our class*\\n\\n{{ $json.text }}\\n\\n_Ask me anything with /ask & see gaps with /gaps_",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1248,
+        -1584
+      ],
+      "id": "32bed4f2-f13d-4271-80dd-8782a6707f5a",
+      "name": "Post to the group",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "48f8e280-5f08-4102-a56f-b3b0ba211db1",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2208,
+        -1152
+      ],
+      "id": "1fd79f68-5bd2-4ae6-984a-4729aa3eee0e",
+      "name": "On workflow error"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2864,
+        -3392
+      ],
+      "id": "90415b8d-e576-47e9-937d-3c465cfcf041",
+      "name": "Telegram Trigger",
+      "webhookId": "8a70d5cd-2360-4a69-bc37-7ea74779f9db",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypvtlJzYsv6KeV6r",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -176,
+        -3936
+      ],
+      "id": "55120f46-7c61-450a-9509-d2c44ad9763a",
+      "name": "Embeddings - Gemini 3072",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "HsfoblTg9NaKdfWU",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -928,
+        -2464
+      ],
+      "id": "61228e91-87ac-4b4b-a7c0-f49284cfbab4",
+      "name": "Embeddings - query 3072",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "HsfoblTg9NaKdfWU",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -896,
+        -4096
+      ],
+      "id": "2fa30c01-57f1-4811-9e37-6ec4e4842591",
+      "name": "Extract PDF text"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d2d69975-59ba-4539-b12e-961465f4a8e4",
+              "name": "extracted_text",
+              "type": "string",
+              "value": "={{ $json.text || $json.data }}"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -688,
+        -4096
+      ],
+      "id": "8dfbddff-dc7a-44f2-94c8-5d860bcb0fce",
+      "name": "Hand off text"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {
+          "headerRow": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -912,
+        -3600
+      ],
+      "id": "de32e059-cb13-408c-8a0a-f43ce9dfce6f",
+      "name": "Extract rows"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Spreadsheets are never embedded. Rows -> document_rows, one summary -> metadata.\nconst g = $('Guards - size, type, id').first().json;\nconst rows = $input.all().map(i => i.json);\nconst columns = rows.length ? Object.keys(rows[0]) : [];\nreturn [{ json: {\n  file_id: g.file_id, title: g.title, subject: g.subject,\n  columns: columns.join(', '), row_count: rows.length,\n  uploaded_by: g.uploaded_by, uploader: g.uploader, chat_id: g.chat_id,\n  rows_json: JSON.stringify(rows)\n}}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -688,
+        -3600
+      ],
+      "id": "51a391ff-eb16-4c1c-9a9b-fe402d06a8c2",
+      "name": "Read schema"
+    },
+    {
+      "parameters": {
+        "content": "### Potential Bug\nSometimes \"Supabase Vector Store\" throws \"Error inserting: TypeError: fetch failed 0\". So, must create a new secret key and update the node.",
+        "height": 156,
+        "width": 340,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -224,
+        -4272
+      ],
+      "id": "1c14c08f-76d6-427b-ab50-8aa8732bfdf6",
+      "name": "note_"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "documents + match_documents()": {
+      "main": [
+        [
+          {
+            "node": "document_metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "document_metadata": {
+      "main": [
+        [
+          {
+            "node": "document_rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "document_rows": {
+      "main": [
+        [
+          {
+            "node": "question_log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it a file?": {
+      "main": [
+        [
+          {
+            "node": "Download from Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Human, not a bot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download from Telegram": {
+      "main": [
+        [
+          {
+            "node": "Normalise - telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data loader": {
+      "ai_document": [
+        [
+          {
+            "node": "Insert into vector store",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recursive splitter 1000/200": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Data loader",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert into vector store": {
+      "main": [
+        [
+          {
+            "node": "Confirm - text indexed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert document_rows": {
+      "main": [
+        [
+          {
+            "node": "Confirm - table indexed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human, not a bot?": {
+      "main": [
+        [
+          {
+            "node": "Route command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load file registry": {
+      "main": [
+        [
+          {
+            "node": "Prepare agent input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare agent input": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Sonnet": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything uploaded?": {
+      "main": [
+        [
+          {
+            "node": "Format doc list",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send - nothing yet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format doc list": {
+      "main": [
+        [
+          {
+            "node": "Send - /docs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format gaps": {
+      "main": [
+        [
+          {
+            "node": "Send - /gaps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build help text": {
+      "main": [
+        [
+          {
+            "node": "Send - /help",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate the week": {
+      "main": [
+        [
+          {
+            "node": "Build digest prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build digest prompt": {
+      "main": [
+        [
+          {
+            "node": "Summarise the week",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude · digest": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Summarise the week",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise the week": {
+      "main": [
+        [
+          {
+            "node": "Post to the group",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format the failure": {
+      "main": [
+        [
+          {
+            "node": "DM the admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by file kind": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply - rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload via web form": {
+      "main": [
+        [
+          {
+            "node": "Normalise - form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run migrations once": {
+      "main": [
+        [
+          {
+            "node": "documents + match_documents()",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert metadata - text": {
+      "main": [
+        [
+          {
+            "node": "Insert into vector store",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert metadata - tabular": {
+      "main": [
+        [
+          {
+            "node": "Insert document_rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise - form": {
+      "main": [
+        [
+          {
+            "node": "Guards - size, type, id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise - telegram": {
+      "main": [
+        [
+          {
+            "node": "Guards - size, type, id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guards - size, type, id": {
+      "main": [
+        [
+          {
+            "node": "Route by file kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Trigger - build & debug": {
+      "main": [
+        [
+          {
+            "node": "Load file registry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route command": {
+      "main": [
+        [
+          {
+            "node": "Load file registry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch registry - /docs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch gaps - /gaps",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build help text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "↩ Reply in thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "search_notes": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "query_table": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "log_question": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Session memory - per user": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch registry - /docs": {
+      "main": [
+        [
+          {
+            "node": "Anything uploaded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch gaps - /gaps": {
+      "main": [
+        [
+          {
+            "node": "Format gaps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sunday 6pm": {
+      "main": [
+        [
+          {
+            "node": "Aggregate the week",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On workflow error": {
+      "main": [
+        [
+          {
+            "node": "Format the failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Is it a file?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings - Gemini 3072": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Insert into vector store",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings - query 3072": {
+      "ai_embedding": [
+        [
+          {
+            "node": "search_notes",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF text": {
+      "main": [
+        [
+          {
+            "node": "Hand off text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hand off text": {
+      "main": [
+        [
+          {
+            "node": "Insert metadata - text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract rows": {
+      "main": [
+        [
+          {
+            "node": "Read schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read schema": {
+      "main": [
+        [
+          {
+            "node": "Insert metadata - tabular",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "10cfed2c-d8c9-4579-b890-f72eea7fc28e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "7171065086926d0f6291bf8fb3c3f3318bbdfa39e7bb3ead588eb80b7c14cc41"
+  },
+  "nodeGroups": [],
+  "id": "u012vngkCo0tmfdJ",
+  "tags": []
+}
